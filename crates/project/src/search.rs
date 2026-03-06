@@ -397,8 +397,13 @@ impl SearchQuery {
             }
         }
     }
-    /// Replaces search hits if replacement is set. `text` is assumed to be a string that matches this `SearchQuery` exactly, without any leftovers on either side.
-    pub fn replacement_for<'a>(&self, text: &'a str) -> Option<Cow<'a, str>> {
+    /// Replaces search hits if replacement is set.
+    ///
+    /// `text` contains the text starting from the match position. `match_len`
+    /// indicates how many bytes of `text` are the actual match; the remainder
+    /// is trailing context needed for lookahead assertions. When no extra
+    /// context is available, `match_len` equals `text.len()`.
+    pub fn replacement_for<'a>(&self, text: &'a str, match_len: usize) -> Option<Cow<'a, str>> {
         match self {
             SearchQuery::Text { replacement, .. } => replacement.clone().map(Cow::from),
             SearchQuery::Regex {
@@ -416,7 +421,11 @@ impl SearchQuery {
                             x => unreachable!("Unexpected escape sequence: {}", x),
                         },
                     );
-                    Some(regex.replace(text, replacement))
+                    let replacement = normalize_capture_references(&replacement);
+                    let result = regex.replace(text, replacement);
+                    let context_after_match = text.len() - match_len;
+                    let replacement_end = result.len().saturating_sub(context_after_match);
+                    Some(Cow::Owned(result[..replacement_end].to_string()))
                 } else {
                     None
                 }
@@ -619,5 +628,68 @@ impl SearchQuery {
             } => Some(*one_match_per_line),
             Self::Text { .. } => None,
         }
+    }
+}
+
+/// Normalizes bare `$N` capture group references to `${N}` form so that
+/// `fancy_regex` doesn't misinterpret trailing text as part of the group
+/// name (e.g. `$1Schema` → `${1}Schema`). Respects `$$` as an escaped
+/// literal dollar sign and already-braced `${N}` references.
+fn normalize_capture_references(replacement: &str) -> Cow<'_, str> {
+    let mut result = String::new();
+    let mut chars = replacement.chars().peekable();
+    let mut modified = false;
+
+    while let Some(ch) = chars.next() {
+        if ch == '$' {
+            match chars.peek() {
+                Some('$') => {
+                    result.push('$');
+                    result.push('$');
+                    chars.next();
+                }
+                Some('{') => {
+                    result.push('$');
+                    result.push('{');
+                    chars.next();
+                    while let Some(&c) = chars.peek() {
+                        result.push(c);
+                        chars.next();
+                        if c == '}' {
+                            break;
+                        }
+                    }
+                }
+                Some(&c) if c.is_ascii_digit() => {
+                    let mut group_num = String::new();
+                    group_num.push(c);
+                    chars.next();
+                    while let Some(&c) = chars.peek() {
+                        if c.is_ascii_digit() {
+                            group_num.push(c);
+                            chars.next();
+                        } else {
+                            break;
+                        }
+                    }
+                    result.push('$');
+                    result.push('{');
+                    result.push_str(&group_num);
+                    result.push('}');
+                    modified = true;
+                }
+                _ => {
+                    result.push('$');
+                }
+            }
+        } else {
+            result.push(ch);
+        }
+    }
+
+    if modified {
+        Cow::Owned(result)
+    } else {
+        Cow::Borrowed(replacement)
     }
 }

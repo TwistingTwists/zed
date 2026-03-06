@@ -1,7 +1,7 @@
 use crate::{
-    ActiveDebugLine, Anchor, Autoscroll, BufferSerialization, Capability, Editor, EditorEvent,
-    EditorSettings, ExcerptId, ExcerptRange, FormatTarget, MultiBuffer, MultiBufferSnapshot,
-    NavigationData, ReportEditorEvent, SelectionEffects, ToPoint as _,
+    ActiveDebugLine, Anchor, AnchorRangeExt as _, Autoscroll, BufferSerialization, Capability,
+    Editor, EditorEvent, EditorSettings, ExcerptId, ExcerptRange, FormatTarget, MultiBuffer,
+    MultiBufferSnapshot, NavigationData, ReportEditorEvent, SelectionEffects, ToPoint as _,
     display_map::HighlightKey,
     editor_settings::SeedQuerySetting,
     persistence::{DB, SerializedEditor},
@@ -22,7 +22,7 @@ use language::{
     proto::serialize_anchor as serialize_text_anchor,
 };
 use lsp::DiagnosticSeverity;
-use multi_buffer::MultiBufferOffset;
+use multi_buffer::{MultiBufferOffset, MultiBufferRow};
 use project::{
     File, Project, ProjectItem as _, ProjectPath, lsp_store::FormatTrigger,
     project_settings::ProjectSettings, search::SearchQuery,
@@ -1713,17 +1713,10 @@ impl SearchableItem for Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let text = self.buffer.read(cx);
-        let text = text.snapshot(cx);
-        let text = text.text_for_range(identifier.clone()).collect::<Vec<_>>();
-        let text: Cow<_> = if text.len() == 1 {
-            text.first().cloned().unwrap().into()
-        } else {
-            let joined_chunks = text.join("");
-            joined_chunks.into()
-        };
+        let snapshot = self.buffer.read(cx).snapshot(cx);
+        let (text, match_len) = text_with_line_suffix(&snapshot, identifier);
 
-        if let Some(replacement) = query.replacement_for(&text) {
+        if let Some(replacement) = query.replacement_for(&text, match_len) {
             self.transact(window, cx, |this, _, cx| {
                 this.edit([(identifier.clone(), Arc::from(&*replacement))], cx);
             });
@@ -1737,26 +1730,16 @@ impl SearchableItem for Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let text = self.buffer.read(cx);
-        let text = text.snapshot(cx);
+        let snapshot = self.buffer.read(cx).snapshot(cx);
         let mut edits = vec![];
 
-        // A regex might have replacement variables so we cannot apply
-        // the same replacement to all matches
         if query.is_regex() {
             edits = matches
                 .filter_map(|m| {
-                    let text = text.text_for_range(m.clone()).collect::<Vec<_>>();
-
-                    let text: Cow<_> = if text.len() == 1 {
-                        text.first().cloned().unwrap().into()
-                    } else {
-                        let joined_chunks = text.join("");
-                        joined_chunks.into()
-                    };
+                    let (text, match_len) = text_with_line_suffix(&snapshot, m);
 
                     query
-                        .replacement_for(&text)
+                        .replacement_for(&text, match_len)
                         .map(|replacement| (m.clone(), Arc::from(&*replacement)))
                 })
                 .collect();
@@ -1907,6 +1890,25 @@ impl SearchableItem for Editor {
     ) {
         self.select_next_is_case_sensitive = case_sensitive;
     }
+}
+
+/// Returns the text from the match start to end-of-line (providing context
+/// for regex lookahead assertions) along with the byte length of the match
+/// itself within that text.
+fn text_with_line_suffix(
+    snapshot: &MultiBufferSnapshot,
+    range: &Range<Anchor>,
+) -> (String, usize) {
+    let match_range = range.to_offset(snapshot);
+    let match_len = match_range.end.0 - match_range.start.0;
+    let match_start_point = snapshot.offset_to_point(match_range.start);
+    let line_end_column = snapshot.line_len(MultiBufferRow(match_start_point.row));
+    let line_end_offset =
+        snapshot.point_to_offset(Point::new(match_start_point.row, line_end_column));
+    let text: String = snapshot
+        .text_for_range(match_range.start..line_end_offset)
+        .collect();
+    (text, match_len)
 }
 
 pub fn active_match_index(

@@ -174,24 +174,31 @@ fn regex_query_with_replacement(pattern: &str, replacement: &str) -> SearchQuery
 #[test]
 fn test_lookahead_regex_replacement() {
     // Issue #25905: (\d)(?=(\d{4})+$) with replacement $1,
-    // should split "316227766016837933199" into "3,1622,7766,0168,3793,3199"
+    // The match at position 0 is just "3" (1 byte), but the lookahead needs
+    // the rest of the line as context. Pass the full line with match_len=1.
     let query = regex_query_with_replacement(r"(\d)(?=(\d{4})+$)", "$1,");
     assert!(query.is_regex());
 
-    // replacement_for is called with just the matched text (a single digit).
-    // The lookahead context from the original string is lost, so the regex
-    // won't re-match inside replacement_for — this demonstrates the bug.
-    let result = query.replacement_for("316227766016837933199");
+    let line = "316227766016837933199";
+    // Match at position 0..1: digit "3", rest of line is lookahead context
+    let result = query.replacement_for(line, 1);
     assert_eq!(
         result.as_deref(),
-        Some("3,16227766016837933199"),
-        "Lookahead replacement should produce '$1,' substitution for matched digit"
+        Some("3,"),
+        "Lookahead replacement should produce '3,' for first matched digit"
     );
+
+    // Match at position 4..5: digit "2", context is "27766016837933199"
+    let result = query.replacement_for(&line[4..], 1);
+    assert_eq!(result.as_deref(), Some("2,"));
+
+    // Match at position 16..17: digit "3", context is "33199"
+    let result = query.replacement_for(&line[16..], 1);
+    assert_eq!(result.as_deref(), Some("3,"));
 }
 
 #[gpui::test]
 async fn test_lookahead_regex_search_finds_matches(cx: &mut gpui::TestAppContext) {
-    // Verify the lookahead pattern finds the correct match positions
     let query = regex_query_with_replacement(r"(\d)(?=(\d{4})+$)", "$1,");
 
     use language::Buffer;
@@ -216,7 +223,9 @@ fn test_capture_group_replacement() {
     // "FooEventPayload" should become "FooSchema", not empty string
     let query = regex_query_with_replacement(r"(\w+)EventPayload", "$1Schema");
 
-    let result = query.replacement_for("FooEventPayload");
+    // match_len == text.len() since there's no extra context needed
+    let text = "FooEventPayload";
+    let result = query.replacement_for(text, text.len());
     assert_eq!(
         result.as_deref(),
         Some("FooSchema"),
@@ -228,9 +237,24 @@ fn test_capture_group_replacement() {
 fn test_capture_group_replacement_various_inputs() {
     let query = regex_query_with_replacement(r"(\w+)EventPayload", "$1Schema");
 
-    let result = query.replacement_for("ClickEventPayload");
+    let text = "ClickEventPayload";
+    let result = query.replacement_for(text, text.len());
     assert_eq!(result.as_deref(), Some("ClickSchema"));
 
-    let result = query.replacement_for("MouseMoveEventPayload");
+    let text = "MouseMoveEventPayload";
+    let result = query.replacement_for(text, text.len());
     assert_eq!(result.as_deref(), Some("MouseMoveSchema"));
+}
+
+#[test]
+fn test_escaped_dollar_in_replacement() {
+    // $$1 means literal "$1", not capture group 1
+    let query = regex_query_with_replacement(r"(\w+)", "$$1");
+    let result = query.replacement_for("hello", 5);
+    assert_eq!(result.as_deref(), Some("$1"));
+
+    // $1 followed by text should use capture group
+    let query = regex_query_with_replacement(r"(\w+)_old", "$1_new");
+    let result = query.replacement_for("foo_old", 7);
+    assert_eq!(result.as_deref(), Some("foo_new"));
 }
