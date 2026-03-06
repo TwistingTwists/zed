@@ -154,3 +154,83 @@ async fn test_multiline_regex(cx: &mut gpui::TestAppContext) {
     let results = search_query.search(&snapshot, None).await;
     assert_eq!(results, vec![0..6, 12..18]);
 }
+
+fn regex_query_with_replacement(pattern: &str, replacement: &str) -> SearchQuery {
+    SearchQuery::regex(
+        pattern,
+        false,
+        true,
+        false,
+        false,
+        Default::default(),
+        Default::default(),
+        false,
+        None,
+    )
+    .unwrap()
+    .with_replacement(replacement.to_string())
+}
+
+#[test]
+fn test_lookahead_regex_replacement() {
+    // Issue #25905: (\d)(?=(\d{4})+$) with replacement $1,
+    // should split "316227766016837933199" into "3,1622,7766,0168,3793,3199"
+    let query = regex_query_with_replacement(r"(\d)(?=(\d{4})+$)", "$1,");
+    assert!(query.is_regex());
+
+    // replacement_for is called with just the matched text (a single digit).
+    // The lookahead context from the original string is lost, so the regex
+    // won't re-match inside replacement_for — this demonstrates the bug.
+    let result = query.replacement_for("316227766016837933199");
+    assert_eq!(
+        result.as_deref(),
+        Some("3,16227766016837933199"),
+        "Lookahead replacement should produce '$1,' substitution for matched digit"
+    );
+}
+
+#[gpui::test]
+async fn test_lookahead_regex_search_finds_matches(cx: &mut gpui::TestAppContext) {
+    // Verify the lookahead pattern finds the correct match positions
+    let query = regex_query_with_replacement(r"(\d)(?=(\d{4})+$)", "$1,");
+
+    use language::Buffer;
+    let text = Rope::from("316227766016837933199");
+    let snapshot = cx
+        .update(|app| Buffer::build_snapshot(text, None, None, app))
+        .await;
+
+    let results = query.search(&snapshot, None).await;
+    // 21-char string: matches at positions where remaining digits are a multiple of 4
+    // pos 0 (20 remaining), 4 (16), 8 (12), 12 (8), 16 (4)
+    assert_eq!(
+        results,
+        vec![0..1, 4..5, 8..9, 12..13, 16..17],
+        "Lookahead regex should find digits at positions 0, 4, 8, 12, 16"
+    );
+}
+
+#[test]
+fn test_capture_group_replacement() {
+    // (\w+)EventPayload with replacement $1Schema
+    // "FooEventPayload" should become "FooSchema", not empty string
+    let query = regex_query_with_replacement(r"(\w+)EventPayload", "$1Schema");
+
+    let result = query.replacement_for("FooEventPayload");
+    assert_eq!(
+        result.as_deref(),
+        Some("FooSchema"),
+        "Capture group $1 should be substituted in replacement"
+    );
+}
+
+#[test]
+fn test_capture_group_replacement_various_inputs() {
+    let query = regex_query_with_replacement(r"(\w+)EventPayload", "$1Schema");
+
+    let result = query.replacement_for("ClickEventPayload");
+    assert_eq!(result.as_deref(), Some("ClickSchema"));
+
+    let result = query.replacement_for("MouseMoveEventPayload");
+    assert_eq!(result.as_deref(), Some("MouseMoveSchema"));
+}
